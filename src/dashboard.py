@@ -25,10 +25,13 @@ MAX_RISK = float(os.getenv("MAX_TOTAL_RISK_DOLLARS", "60.0"))
 st.set_page_config(page_title="Trading Bot Dashboard", layout="wide", initial_sidebar_state="expanded")
 st.title("🎯 Kalshi Trading Bot - Live Dashboard")
 
-# Cache DB connection
-@st.cache_resource
+# Add manual refresh button
+if st.button("🔄 Refresh Now", key="refresh_btn"):
+    st.rerun()
+
+# Create fresh DB connection on each run (no caching)
 def get_db():
-    return sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    return sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10)
 
 conn = get_db()
 
