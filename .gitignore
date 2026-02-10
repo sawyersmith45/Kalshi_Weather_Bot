@@ -1,0 +1,44 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables (NEVER commit API keys!)
+.env
+.env.local
+
+# Database (live trading data)
+data/kalshi_quotes.sqlite
+data/kalshi_quotes.sqlite-shm
+data/kalshi_quotes.sqlite-wal
+kalshi.db
+
+# Sensitive files
+keys/
+
+# OS
+.DS_Store
+Thumbs.db
+.gitkeep
+
+# Streamlit cache
+.streamlit/
