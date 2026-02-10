@@ -30,7 +30,15 @@ build/
 data/kalshi_quotes.sqlite
 data/kalshi_quotes.sqlite-shm
 data/kalshi_quotes.sqlite-wal
+data/kalshi_quotes.sqlite.bak
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/*.bak
 kalshi.db
+*.db
+*.sqlite
+*.sqlite3
 
 # Sensitive files
 keys/
@@ -42,3 +50,6 @@ Thumbs.db
 
 # Streamlit cache
 .streamlit/
+
+# Local logs/debug artifacts
+bot.log

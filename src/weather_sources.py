@@ -2,7 +2,6 @@
 import os
 import math
 import requests
-import requests
 from datetime import datetime
 from calendar import monthrange
 
@@ -55,6 +54,49 @@ class OpenMeteoProvider(WeatherProvider):
         j = r.json() or {}
         daily = j.get("daily") or {}
         tmax = (daily.get("temperature_2m_max") or [None])[0]
+        return None if tmax is None else float(tmax)
+
+
+class VisualCrossingProvider(WeatherProvider):
+    name = "visual_crossing"
+
+    def __init__(self, api_key: str | None = None, timeout_s: int = 15):
+        self.api_key = (api_key or os.getenv("VISUAL_CROSSING_API_KEY", "")).strip()
+        self.timeout_s = timeout_s
+
+    def get_high_f(self, lat: float, lon: float, target_date: str, timezone: str = "UTC") -> float | None:
+        # If no key is configured, disable provider quietly.
+        if not self.api_key:
+            return None
+
+        loc = f"{float(lat):.5f},{float(lon):.5f}"
+        url = (
+            "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/"
+            f"timeline/{loc}/{target_date}/{target_date}"
+        )
+        params = {
+            "unitGroup": "us",
+            "include": "days",
+            "key": self.api_key,
+            "contentType": "json",
+        }
+
+        r = requests.get(url, params=params, timeout=self.timeout_s)
+        r.raise_for_status()
+        j = r.json() or {}
+        days = j.get("days") or []
+        if not isinstance(days, list) or not days:
+            return None
+
+        for d in days:
+            if not isinstance(d, dict):
+                continue
+            if str(d.get("datetime")) == str(target_date):
+                tmax = d.get("tempmax")
+                return None if tmax is None else float(tmax)
+
+        first = days[0] if isinstance(days[0], dict) else {}
+        tmax = first.get("tempmax")
         return None if tmax is None else float(tmax)
 
 

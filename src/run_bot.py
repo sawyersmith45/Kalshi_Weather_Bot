@@ -52,6 +52,7 @@ from src.db import (
 from src.weather_sources import (
     NWSProvider,
     OpenMeteoProvider,
+    VisualCrossingProvider,
     OpenMeteoEnsembleProvider,
     AnalogEnsembleProvider,
     OpenMeteoHourlyFeaturesProvider,
@@ -129,6 +130,8 @@ EMPIRICAL_MIN_MEMBERS = int(os.getenv("EMPIRICAL_MIN_MEMBERS", "5"))  # Lower th
 EMPIRICAL_SMOOTH_SIGMA = float(os.getenv("EMPIRICAL_SMOOTH_SIGMA", "0.9"))
 
 # ---- Weather Provider Configuration ----
+USE_VISUAL_CROSSING = os.getenv("USE_VISUAL_CROSSING", "0") == "1"  # Optional independent provider
+VISUAL_CROSSING_TIMEOUT = int(os.getenv("VISUAL_CROSSING_TIMEOUT", "15"))
 USE_ANALOG_ENSEMBLE = os.getenv("USE_ANALOG_ENSEMBLE", "0") == "1"  # Disable by default (slow, 45+ archive API calls)
 ANALOG_ENSEMBLE_TIMEOUT = int(os.getenv("ANALOG_ENSEMBLE_TIMEOUT", "30"))  # Timeout per fetch in seconds
 WEATHER_FETCH_DEBUG = os.getenv("WEATHER_FETCH_DEBUG", "0") == "1"  # Log each weather provider result
@@ -315,6 +318,17 @@ HOURLY_FILTER_MIN_CLOSED_TRADES = int(os.getenv("HOURLY_FILTER_MIN_CLOSED_TRADES
 HOURLY_FILTER_MIN_EXPECTANCY_DOLLARS = float(os.getenv("HOURLY_FILTER_MIN_EXPECTANCY_DOLLARS", "0.0"))
 
 MAX_TRADES_PER_TICKER_PER_DAY = int(os.getenv("MAX_TRADES_PER_TICKER_PER_DAY", "8"))
+
+# ===== PROBABILITY / PRICE ENTRY GUARDS =====
+MIN_FAIR_PROB_PCT = float(os.getenv("MIN_FAIR_PROB_PCT", "8.0"))  # Skip BUYs if model fair probability is too low
+MIN_BUY_ASK_CENTS = int(os.getenv("MIN_BUY_ASK_CENTS", "4"))  # Skip BUYs below this ask price
+MAX_BUY_ASK_CENTS = int(os.getenv("MAX_BUY_ASK_CENTS", "80"))  # Skip BUYs above this ask price
+
+TAIL_PENALTY_ENABLED = os.getenv("TAIL_PENALTY_ENABLED", "1") == "1"  # Penalize extreme-tail probabilities
+TAIL_PENALTY_CENTER_PCT = float(os.getenv("TAIL_PENALTY_CENTER_PCT", "50.0"))  # Center point where penalty is zero
+TAIL_PENALTY_FREE_BAND_PCT = float(os.getenv("TAIL_PENALTY_FREE_BAND_PCT", "10.0"))  # No penalty within +/- this band
+TAIL_PENALTY_SLOPE_CENTS_PER_PCT = float(os.getenv("TAIL_PENALTY_SLOPE_CENTS_PER_PCT", "0.06"))  # Cents penalty per 1% tail distance
+TAIL_PENALTY_CAP_CENTS = float(os.getenv("TAIL_PENALTY_CAP_CENTS", "4.0"))  # Cap tail penalty
 
 # ===== CALIBRATION DIAGNOSTICS =====
 CALIBRATION_DIAG_LOOKBACK_HOURS = int(os.getenv("CALIBRATION_DIAG_LOOKBACK_HOURS", "168"))
@@ -2315,6 +2329,11 @@ def main():
         logger.info(f"[DB] Initial stats: {stats}")
 
     providers = [NWSProvider(), OpenMeteoProvider(), OpenMeteoEnsembleProvider()]
+    if USE_VISUAL_CROSSING:
+        vc_provider = VisualCrossingProvider(timeout_s=VISUAL_CROSSING_TIMEOUT)
+        providers.append(vc_provider)
+        if not getattr(vc_provider, "api_key", ""):
+            logger.warning("USE_VISUAL_CROSSING=1 but VISUAL_CROSSING_API_KEY is not set; provider will be skipped.")
     if USE_ANALOG_ENSEMBLE:
         providers.append(AnalogEnsembleProvider(timeout_s=ANALOG_ENSEMBLE_TIMEOUT))
     
@@ -2325,6 +2344,8 @@ def main():
         "open_meteo": float(os.getenv("W_OPEN_METEO", "0.9")),
         "open_meteo_ens": float(os.getenv("W_OPEN_METEO_ENS", "1.5")),
     }
+    if USE_VISUAL_CROSSING:
+        default_weights["visual_crossing"] = float(os.getenv("W_VISUAL_CROSSING", "1.1"))
     if USE_ANALOG_ENSEMBLE:
         default_weights["analog_ens"] = float(os.getenv("W_ANALOG_ENS", "1.8"))
 
@@ -2817,9 +2838,11 @@ def main():
                 base_sigma = baseline_sigma_for(series, target_date)
 
                 biases = {}
-                bias_names = ("nws", "open_meteo", "open_meteo_ens")
+                bias_names = ["nws", "open_meteo", "open_meteo_ens"]
+                if USE_VISUAL_CROSSING:
+                    bias_names.append("visual_crossing")
                 if USE_ANALOG_ENSEMBLE:
-                    bias_names = ("nws", "open_meteo", "open_meteo_ens", "analog_ens")
+                    bias_names.append("analog_ens")
                 for name in bias_names:
                     v = get_state(conn, f"bias:{series}:{name}", "")
                     biases[name] = float(v) if v else 0.0
@@ -2933,6 +2956,10 @@ def main():
 
                 checked = 0
                 cand = 0
+                buy_reject_ask_low = 0
+                buy_reject_ask_high = 0
+                buy_reject_fair_low = 0
+                buy_reject_edge = 0
 
                 for m in markets:
                     ticker = m.get("ticker")
@@ -2970,22 +2997,59 @@ def main():
                     buy_edge = fair - float(ask)
                     sell_edge = float(bid) - fair
 
-                    eff_buy = buy_edge - (spread / 2.0) - COST_BUFFER_CENTS - adaptive_edge_penalty
+                    tail_penalty = 0.0
+                    if TAIL_PENALTY_ENABLED:
+                        tail_distance = abs(float(fair) - float(TAIL_PENALTY_CENTER_PCT))
+                        penalized_distance = max(0.0, tail_distance - float(TAIL_PENALTY_FREE_BAND_PCT))
+                        tail_penalty = min(
+                            float(TAIL_PENALTY_CAP_CENTS),
+                            penalized_distance * float(TAIL_PENALTY_SLOPE_CENTS_PER_PCT),
+                        )
+
+                    eff_buy = buy_edge - (spread / 2.0) - COST_BUFFER_CENTS - adaptive_edge_penalty - tail_penalty
                     eff_sell = sell_edge - (spread / 2.0) - COST_BUFFER_CENTS
 
                     checked += 1
                     cur_qty, cur_avg = get_position_effective(conn, ticker, live_pos)
 
                     buy_thresh = min_edge_now + (NEW_POS_EDGE_BONUS if cur_qty == 0 else 0.0)
-                    if eff_buy >= buy_thresh:
+                    buy_gate_ok = True
+                    gate_reason = ""
+                    if int(ask) < int(MIN_BUY_ASK_CENTS):
+                        buy_gate_ok = False
+                        gate_reason = "ASK_TOO_LOW"
+                        buy_reject_ask_low += 1
+                    elif int(ask) > int(MAX_BUY_ASK_CENTS):
+                        buy_gate_ok = False
+                        gate_reason = "ASK_TOO_HIGH"
+                        buy_reject_ask_high += 1
+                    elif float(fair) < float(MIN_FAIR_PROB_PCT):
+                        buy_gate_ok = False
+                        gate_reason = "FAIR_TOO_LOW"
+                        buy_reject_fair_low += 1
+
+                    if buy_gate_ok and eff_buy >= buy_thresh:
                         candidates.append((float(eff_buy), series, "BUY", ticker, bid, ask, float(fair), int(spread), cur_qty, cur_avg))
                         cand += 1
+                    elif not buy_gate_ok:
+                        if LOG_CANDIDATE_REJECTION:
+                            logger.debug(
+                                f"REJECT_BUY {ticker} reason={gate_reason} "
+                                f"(fair={fair:.1f}%, ask={ask}, min_fair={MIN_FAIR_PROB_PCT:.1f}%, "
+                                f"ask_range=[{MIN_BUY_ASK_CENTS},{MAX_BUY_ASK_CENTS}])"
+                            )
                     elif LOG_CANDIDATE_REJECTION and eff_buy > -2.0:  # Only log near-misses to avoid spam
+                        buy_reject_edge += 1
                         logger.debug(
                             f"REJECT_BUY {ticker} eff_buy={eff_buy:.2f}c < thresh={buy_thresh:.2f}c "
                             f"(fair={fair:.1f}, ask={ask}, buy_edge={buy_edge:.2f}, "
-                            f"min_edge={min_edge_now:.2f}, adaptive_penalty={adaptive_edge_penalty:.2f})"
+                            f"min_edge={min_edge_now:.2f}, adaptive_penalty={adaptive_edge_penalty:.2f}, "
+                            f"tail_penalty={tail_penalty:.2f})"
                         )
+                    elif not LOG_CANDIDATE_REJECTION:
+                        buy_reject_edge += 1
+                    else:
+                        buy_reject_edge += 1
 
                     if cur_qty > 0:
                         profit_edge = float(bid) - float(cur_avg)
@@ -3044,7 +3108,11 @@ def main():
                             candidates.append((float(rank), series, "SELL", ticker, bid, ask, float(fair), int(spread), cur_qty, cur_avg))
                             cand += 1
 
-                logger.info(f"SUMMARY {series} event={event_ticker} date={target_date} cand={cand} checked={checked}")
+                logger.info(
+                    f"SUMMARY {series} event={event_ticker} date={target_date} cand={cand} checked={checked} "
+                    f"buy_rejects=(ask_low={buy_reject_ask_low}, ask_high={buy_reject_ask_high}, "
+                    f"fair_low={buy_reject_fair_low}, edge={buy_reject_edge})"
+                )
 
             candidates.sort(reverse=True, key=lambda x: x[0])
 
