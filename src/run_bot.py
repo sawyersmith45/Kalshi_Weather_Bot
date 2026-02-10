@@ -289,6 +289,38 @@ VOL_ALERT_ENABLED = os.getenv("VOL_ALERT_ENABLED", "1") == "1"  # Enable spike d
 VOL_SPIKE_THRESHOLD = float(os.getenv("VOL_SPIKE_THRESHOLD", "2.0"))  # Alert if recent vol > historical vol * threshold
 VOL_ALERT_LOG_INTERVAL_HOURS = float(os.getenv("VOL_ALERT_LOG_INTERVAL_HOURS", "1"))  # Log spikes every N hours
 
+# ===== LOSS PROTECTION / ADAPTIVE EDGE GATE =====
+DAILY_DRAWDOWN_STOP_PCT = float(os.getenv("DAILY_DRAWDOWN_STOP_PCT", "8.0"))  # Block new buys for day if balance drawdown exceeds this %
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))  # Block new buys after this many consecutive closed losing trades
+CONSECUTIVE_LOSS_LOOKBACK_HOURS = int(os.getenv("CONSECUTIVE_LOSS_LOOKBACK_HOURS", "72"))  # Trade history window for streak detection
+LOSS_STREAK_COOLDOWN_MINUTES = int(os.getenv("LOSS_STREAK_COOLDOWN_MINUTES", "180"))  # Buy block duration after streak trigger
+
+ADAPTIVE_EDGE_GATE_ENABLED = os.getenv("ADAPTIVE_EDGE_GATE_ENABLED", "1") == "1"  # Penalize required edge when execution quality degrades
+ADAPTIVE_EDGE_LOOKBACK_HOURS = int(os.getenv("ADAPTIVE_EDGE_LOOKBACK_HOURS", "6"))  # Fill analytics lookback for adaptive edge
+ADAPTIVE_EDGE_MIN_ORDERS = int(os.getenv("ADAPTIVE_EDGE_MIN_ORDERS", "20"))  # Minimum sample size before applying penalty
+ADAPTIVE_EDGE_TARGET_FILL_RATE = float(os.getenv("ADAPTIVE_EDGE_TARGET_FILL_RATE", "70.0"))  # Fill-rate target (%)
+ADAPTIVE_EDGE_REJECT_WEIGHT = float(os.getenv("ADAPTIVE_EDGE_REJECT_WEIGHT", "0.05"))  # Cents penalty per 1% fill-rate gap
+ADAPTIVE_EDGE_SLIPPAGE_WEIGHT = float(os.getenv("ADAPTIVE_EDGE_SLIPPAGE_WEIGHT", "1.0"))  # Multiplier on avg slippage penalty
+ADAPTIVE_EDGE_MAX_PENALTY_CENTS = float(os.getenv("ADAPTIVE_EDGE_MAX_PENALTY_CENTS", "6.0"))  # Hard cap on added penalty
+
+# ===== ENTRY QUALITY FILTERS =====
+SERIES_EXPECTANCY_FILTER_ENABLED = os.getenv("SERIES_EXPECTANCY_FILTER_ENABLED", "1") == "1"
+SERIES_EXPECTANCY_LOOKBACK_HOURS = int(os.getenv("SERIES_EXPECTANCY_LOOKBACK_HOURS", "168"))
+SERIES_EXPECTANCY_MIN_CLOSED_TRADES = int(os.getenv("SERIES_EXPECTANCY_MIN_CLOSED_TRADES", "20"))
+SERIES_EXPECTANCY_MIN_EDGE_DOLLARS = float(os.getenv("SERIES_EXPECTANCY_MIN_EDGE_DOLLARS", "0.0"))
+
+HOURLY_FILTER_ENABLED = os.getenv("HOURLY_FILTER_ENABLED", "1") == "1"
+HOURLY_FILTER_LOOKBACK_HOURS = int(os.getenv("HOURLY_FILTER_LOOKBACK_HOURS", "336"))
+HOURLY_FILTER_MIN_CLOSED_TRADES = int(os.getenv("HOURLY_FILTER_MIN_CLOSED_TRADES", "20"))
+HOURLY_FILTER_MIN_EXPECTANCY_DOLLARS = float(os.getenv("HOURLY_FILTER_MIN_EXPECTANCY_DOLLARS", "0.0"))
+
+MAX_TRADES_PER_TICKER_PER_DAY = int(os.getenv("MAX_TRADES_PER_TICKER_PER_DAY", "8"))
+
+# ===== CALIBRATION DIAGNOSTICS =====
+CALIBRATION_DIAG_LOOKBACK_HOURS = int(os.getenv("CALIBRATION_DIAG_LOOKBACK_HOURS", "168"))
+CALIBRATION_DIAG_BINS = int(os.getenv("CALIBRATION_DIAG_BINS", "10"))
+CALIBRATION_DIAG_MIN_SAMPLES = int(os.getenv("CALIBRATION_DIAG_MIN_SAMPLES", "30"))
+
 DB_CLEANUP_EVERY_MINUTES = int(os.getenv("DB_CLEANUP_EVERY_MINUTES", "120"))  # Run cleanup every N minutes
 DB_CLEANUP_KEEP_HOURS = int(os.getenv("DB_CLEANUP_KEEP_HOURS", "72"))  # Keep snapshots for N hours, delete older
 DB_VACUUM_EVERY_HOURS = int(os.getenv("DB_VACUUM_EVERY_HOURS", "24"))  # Run VACUUM every N hours
@@ -1834,6 +1866,322 @@ def _dynamic_trade_step(edge_eff: float):
     return int(base * mult)
 
 
+def _matched_closed_trade_pnls(conn, lookback_hours: int = 72):
+    """Return closed trade legs as (ts_utc, pnl_dollars) using FIFO buy/sell matching."""
+    try:
+        rows = conn.execute(
+            f"""SELECT ticker, side, price, qty, ts_utc
+                FROM trades
+                WHERE datetime(ts_utc) > datetime('now', '-' || ? || ' hours')
+                ORDER BY datetime(ts_utc) ASC, id ASC""",
+            (int(lookback_hours),),
+        ).fetchall()
+    except Exception:
+        return []
+
+    lots_by_ticker = {}
+    closed = []
+
+    for ticker, side, price, qty, ts_utc in rows:
+        ticker = str(ticker)
+        side = str(side).upper()
+        price = float(price)
+        qty = int(qty or 0)
+        if qty <= 0:
+            continue
+
+        if ticker not in lots_by_ticker:
+            lots_by_ticker[ticker] = []
+
+        if side == "BUY":
+            lots_by_ticker[ticker].append([price, qty])
+            continue
+
+        if side != "SELL":
+            continue
+
+        remaining = qty
+        buy_lots = lots_by_ticker[ticker]
+        while remaining > 0 and buy_lots:
+            buy_price, buy_qty = buy_lots[0]
+            match_qty = min(int(remaining), int(buy_qty))
+            pnl = (float(price) - float(buy_price)) * float(match_qty) / 100.0
+            closed.append((str(ts_utc), float(pnl)))
+            remaining -= match_qty
+            buy_qty -= match_qty
+            if buy_qty <= 0:
+                buy_lots.pop(0)
+            else:
+                buy_lots[0][1] = buy_qty
+
+    return closed
+
+
+def compute_consecutive_closed_losses(conn, lookback_hours: int = 72):
+    """Count trailing consecutive losing closed trade legs."""
+    closed = _matched_closed_trade_pnls(conn, lookback_hours=lookback_hours)
+    if not closed:
+        return 0, 0
+
+    streak = 0
+    for _, pnl in reversed(closed):
+        if pnl < 0:
+            streak += 1
+        elif pnl > 0:
+            break
+    return streak, len(closed)
+
+
+def compute_adaptive_edge_penalty_cents(conn):
+    """Execution-quality penalty (in cents) to subtract from buy edge."""
+    if not ADAPTIVE_EDGE_GATE_ENABLED:
+        return 0.0, {}
+
+    fills = compute_fill_analytics(conn, lookback_hours=ADAPTIVE_EDGE_LOOKBACK_HOURS)
+    total_orders = int((fills or {}).get("total_orders", 0))
+    if total_orders < ADAPTIVE_EDGE_MIN_ORDERS:
+        return 0.0, {"reason": "insufficient_sample", "total_orders": total_orders}
+
+    avg_slippage = float((fills or {}).get("avg_slippage_per_order", 0.0))
+    fill_rate = float((fills or {}).get("fill_rate", 0.0))
+
+    slippage_penalty = max(0.0, avg_slippage) * float(ADAPTIVE_EDGE_SLIPPAGE_WEIGHT)
+    fill_gap = max(0.0, float(ADAPTIVE_EDGE_TARGET_FILL_RATE) - fill_rate)
+    reject_penalty = fill_gap * float(ADAPTIVE_EDGE_REJECT_WEIGHT)
+
+    penalty = min(float(ADAPTIVE_EDGE_MAX_PENALTY_CENTS), slippage_penalty + reject_penalty)
+    return float(penalty), {
+        "total_orders": total_orders,
+        "fill_rate": fill_rate,
+        "avg_slippage_per_order": avg_slippage,
+        "slippage_penalty": slippage_penalty,
+        "reject_penalty": reject_penalty,
+    }
+
+
+def _matched_closed_trade_legs(conn, lookback_hours: int = 72):
+    """Return matched closed trade legs using FIFO as dict records."""
+    try:
+        rows = conn.execute(
+            f"""SELECT ticker, side, price, qty, ts_utc
+                FROM trades
+                WHERE datetime(ts_utc) > datetime('now', '-' || ? || ' hours')
+                ORDER BY datetime(ts_utc) ASC, id ASC""",
+            (int(lookback_hours),),
+        ).fetchall()
+    except Exception:
+        return []
+
+    lots_by_ticker = {}
+    out = []
+
+    for ticker, side, price, qty, ts_utc in rows:
+        ticker = str(ticker)
+        side = str(side).upper()
+        price = float(price)
+        qty = int(qty or 0)
+        if qty <= 0:
+            continue
+
+        if ticker not in lots_by_ticker:
+            lots_by_ticker[ticker] = []
+
+        if side == "BUY":
+            lots_by_ticker[ticker].append([price, qty])
+            continue
+        if side != "SELL":
+            continue
+
+        remaining = qty
+        buy_lots = lots_by_ticker[ticker]
+        while remaining > 0 and buy_lots:
+            buy_price, buy_qty = buy_lots[0]
+            match_qty = min(int(remaining), int(buy_qty))
+            pnl = (float(price) - float(buy_price)) * float(match_qty) / 100.0
+            close_dt = parse_iso(str(ts_utc))
+            series = ticker.split("_")[0] if "_" in ticker else ticker
+            out.append(
+                {
+                    "ticker": ticker,
+                    "series": series,
+                    "close_ts": str(ts_utc),
+                    "close_hour_utc": int(close_dt.hour) if close_dt else None,
+                    "pnl": float(pnl),
+                }
+            )
+            remaining -= match_qty
+            buy_qty -= match_qty
+            if buy_qty <= 0:
+                buy_lots.pop(0)
+            else:
+                buy_lots[0][1] = buy_qty
+
+    return out
+
+
+def compute_series_expectancy_stats(conn, lookback_hours: int = 168, min_closed_trades: int = 20):
+    """Compute rolling expectancy per series from closed trade legs."""
+    legs = _matched_closed_trade_legs(conn, lookback_hours=lookback_hours)
+    by_series = {}
+    for leg in legs:
+        s = str(leg.get("series") or "")
+        pnl = float(leg.get("pnl") or 0.0)
+        if not s:
+            continue
+        if s not in by_series:
+            by_series[s] = {"count": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0, "sum_win": 0.0, "sum_loss": 0.0}
+        m = by_series[s]
+        m["count"] += 1
+        m["sum_pnl"] += pnl
+        if pnl > 0:
+            m["wins"] += 1
+            m["sum_win"] += pnl
+        elif pnl < 0:
+            m["losses"] += 1
+            m["sum_loss"] += pnl
+
+    out = {}
+    for s, m in by_series.items():
+        cnt = int(m["count"])
+        if cnt < int(min_closed_trades):
+            continue
+        wins = int(m["wins"])
+        losses = int(m["losses"])
+        avg_win = (m["sum_win"] / wins) if wins > 0 else 0.0
+        avg_loss = (m["sum_loss"] / losses) if losses > 0 else 0.0
+        win_rate = (100.0 * wins / cnt) if cnt > 0 else 0.0
+        expectancy = m["sum_pnl"] / cnt if cnt > 0 else 0.0
+        out[s] = {
+            "count": cnt,
+            "win_rate": win_rate,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "expectancy": expectancy,
+            "total_pnl": m["sum_pnl"],
+        }
+    return out
+
+
+def compute_hourly_expectancy(conn, lookback_hours: int = 336):
+    """Compute closed-trade expectancy per UTC hour."""
+    legs = _matched_closed_trade_legs(conn, lookback_hours=lookback_hours)
+    by_hour = {}
+    for leg in legs:
+        hr = leg.get("close_hour_utc")
+        if hr is None:
+            continue
+        hr = int(hr)
+        pnl = float(leg.get("pnl") or 0.0)
+        if hr not in by_hour:
+            by_hour[hr] = {"count": 0, "sum_pnl": 0.0}
+        by_hour[hr]["count"] += 1
+        by_hour[hr]["sum_pnl"] += pnl
+
+    out = {}
+    for hr, m in by_hour.items():
+        cnt = int(m["count"])
+        exp = (m["sum_pnl"] / cnt) if cnt > 0 else 0.0
+        out[hr] = {"count": cnt, "expectancy": exp, "total_pnl": m["sum_pnl"]}
+    return out
+
+
+def compute_calibration_diagnostics(conn, lookback_hours: int = 168, bins: int = 10):
+    """Detailed calibration diagnostics (ECE/MCE/reliability) overall, by method, and by series."""
+    bins = max(5, min(20, int(bins)))
+    rows = conn.execute(
+        """
+        SELECT forecast_prob, outcome, forecast_method, series
+        FROM forecast_predictions
+        WHERE outcome IS NOT NULL
+          AND datetime(outcome_ts_utc) > datetime('now', '-' || ? || ' hours')
+        """,
+        (int(lookback_hours),),
+    ).fetchall()
+
+    def normalize_prob(x):
+        p = float(x)
+        if p > 1.0:
+            p = p / 100.0
+        return max(1e-6, min(1.0 - 1e-6, p))
+
+    def bucket_add(store, prob, outcome):
+        idx = min(bins - 1, int(prob * bins))
+        if idx not in store["bins"]:
+            store["bins"][idx] = {"count": 0, "sum_prob": 0.0, "sum_outcome": 0.0}
+        b = store["bins"][idx]
+        b["count"] += 1
+        b["sum_prob"] += prob
+        b["sum_outcome"] += outcome
+
+    def new_group():
+        return {"count": 0, "brier": 0.0, "log_loss": 0.0, "accuracy": 0, "bins": {}}
+
+    groups = {"overall": new_group(), "method": {}, "series": {}}
+
+    for prob_raw, outcome_raw, method_raw, series_raw in rows:
+        try:
+            p = normalize_prob(prob_raw)
+            o = float(outcome_raw)
+        except Exception:
+            continue
+        if o not in (0.0, 1.0):
+            continue
+
+        method = str(method_raw or "unknown")
+        series = str(series_raw or "unknown")
+        for key, name in (("overall", "overall"), ("method", method), ("series", series)):
+            g = groups[key] if key == "overall" else groups[key].setdefault(name, new_group())
+            g["count"] += 1
+            g["brier"] += (p - o) ** 2
+            g["log_loss"] += -(o * math.log(p) + (1.0 - o) * math.log(1.0 - p))
+            if (p >= 0.5 and o == 1.0) or (p < 0.5 and o == 0.0):
+                g["accuracy"] += 1
+            bucket_add(g, p, o)
+
+    def finalize(group):
+        cnt = int(group["count"])
+        if cnt <= 0:
+            return {"count": 0}
+        ece = 0.0
+        mce = 0.0
+        rel = []
+        for idx in sorted(group["bins"].keys()):
+            b = group["bins"][idx]
+            bc = int(b["count"])
+            if bc <= 0:
+                continue
+            avg_p = b["sum_prob"] / bc
+            avg_o = b["sum_outcome"] / bc
+            gap = abs(avg_p - avg_o)
+            ece += gap * (bc / cnt)
+            mce = max(mce, gap)
+            rel.append(
+                {
+                    "bin": idx,
+                    "count": bc,
+                    "avg_pred": avg_p,
+                    "avg_outcome": avg_o,
+                    "gap": gap,
+                }
+            )
+        return {
+            "count": cnt,
+            "brier": group["brier"] / cnt,
+            "log_loss": group["log_loss"] / cnt,
+            "accuracy": group["accuracy"] / cnt,
+            "ece": ece,
+            "mce": mce,
+            "reliability": rel,
+        }
+
+    out = {
+        "overall": finalize(groups["overall"]),
+        "method": {k: finalize(v) for k, v in groups["method"].items()},
+        "series": {k: finalize(v) for k, v in groups["series"].items()},
+    }
+    return out
+
+
 def settle_yesterday_outcomes(client: KalshiClient, conn, now_dt: datetime, ts: str):
     """Settle outcomes for yesterday's events with robust error handling."""
     archive_truth = OpenMeteoArchiveProvider(timeout_s=30)
@@ -1945,7 +2293,15 @@ def settle_yesterday_outcomes(client: KalshiClient, conn, now_dt: datetime, ts: 
 
 def main():
     client = KalshiClient()
-    conn = open_db("data/kalshi_quotes.sqlite")
+    # Use absolute path based on this file's location
+    from pathlib import Path
+    db_path = Path(__file__).parent.parent / "data" / "kalshi_quotes.sqlite"
+    conn = open_db(str(db_path))
+    # Log the DB path being used so we can diagnose mismatches between processes
+    try:
+        logger.info(f"[DB] Using database path: {db_path}")
+    except Exception:
+        print(f"[DB] Using database path: {db_path}")
     
     # Run integrity check on startup
     if DB_INTEGRITY_CHECK:
@@ -2008,6 +2364,7 @@ def main():
     
     consecutive_errors = 0
     max_consecutive_errors = 5
+    live_pos = {}
 
     while True:
         ts = iso_now()
@@ -2045,6 +2402,7 @@ def main():
         # Log calibration metrics periodically
         if CALIBRATION_TRACKING_ENABLED and now_seconds - calibration_last_log > CALIBRATION_LOG_INTERVAL_HOURS * 3600:
             try:
+                # Keep legacy summary
                 metrics = compute_calibration_metrics(conn, lookback_hours=CALIBRATION_LOG_INTERVAL_HOURS)
                 if metrics:
                     for method, m in metrics.items():
@@ -2052,6 +2410,48 @@ def main():
                             f"[CALIBRATION] method={method} count={m['count']} "
                             f"brier={m['brier']:.4f} log_loss={m['log_loss']:.4f} accuracy={m['accuracy']:.2%}"
                         )
+
+                # Enhanced diagnostics
+                diag = compute_calibration_diagnostics(
+                    conn,
+                    lookback_hours=CALIBRATION_DIAG_LOOKBACK_HOURS,
+                    bins=CALIBRATION_DIAG_BINS,
+                )
+                overall = diag.get("overall", {})
+                if overall and int(overall.get("count", 0)) > 0:
+                    logger.info(
+                        f"[CALIBRATION_DIAG] overall count={overall['count']} brier={overall['brier']:.4f} "
+                        f"log_loss={overall['log_loss']:.4f} acc={overall['accuracy']:.2%} "
+                        f"ece={overall['ece']:.4f} mce={overall['mce']:.4f}"
+                    )
+                    rel = sorted(overall.get("reliability", []), key=lambda x: x.get("gap", 0.0), reverse=True)
+                    if rel:
+                        w = rel[0]
+                        logger.info(
+                            f"[CALIBRATION_DIAG] worst_bin bin={w['bin']} count={w['count']} "
+                            f"avg_pred={w['avg_pred']:.3f} avg_outcome={w['avg_outcome']:.3f} gap={w['gap']:.3f}"
+                        )
+
+                method_diag = [
+                    (k, v) for k, v in (diag.get("method") or {}).items()
+                    if int(v.get("count", 0)) >= CALIBRATION_DIAG_MIN_SAMPLES
+                ]
+                for method, m in sorted(method_diag, key=lambda kv: kv[1].get("ece", 0.0), reverse=True)[:5]:
+                    logger.info(
+                        f"[CALIBRATION_METHOD] {method} count={m['count']} acc={m['accuracy']:.2%} "
+                        f"brier={m['brier']:.4f} ece={m['ece']:.4f} mce={m['mce']:.4f}"
+                    )
+
+                series_diag = [
+                    (k, v) for k, v in (diag.get("series") or {}).items()
+                    if int(v.get("count", 0)) >= CALIBRATION_DIAG_MIN_SAMPLES
+                ]
+                for series_name, m in sorted(series_diag, key=lambda kv: kv[1].get("ece", 0.0), reverse=True)[:8]:
+                    logger.info(
+                        f"[CALIBRATION_SERIES] {series_name} count={m['count']} acc={m['accuracy']:.2%} "
+                        f"brier={m['brier']:.4f} ece={m['ece']:.4f} mce={m['mce']:.4f}"
+                    )
+
                 calibration_last_log = now_seconds
             except Exception as e:
                 logger.warning(f"Calibration logging error: {e}")
@@ -2253,6 +2653,131 @@ def main():
                 if live_pos:
                     reconcile_positions_to_db(conn, live_pos)
 
+            # ---- Safety breakers: block only new BUY entries; allow SELL exits ----
+            block_new_buys = False
+            block_reasons = []
+
+            if LIVE_TRADING and bal_cents is not None and DAILY_DRAWDOWN_STOP_PCT > 0:
+                day_start_key = f"risk:day_start_balance_cents:{day_key}"
+                day_start_raw = get_state(conn, day_start_key, "")
+                if day_start_raw:
+                    try:
+                        day_start_bal = int(day_start_raw)
+                    except Exception:
+                        day_start_bal = int(bal_cents)
+                        set_state(conn, day_start_key, str(day_start_bal))
+                else:
+                    day_start_bal = int(bal_cents)
+                    set_state(conn, day_start_key, str(day_start_bal))
+
+                if day_start_bal > 0:
+                    drawdown_pct = 100.0 * max(0, day_start_bal - int(bal_cents)) / float(day_start_bal)
+                    drawdown_latch_key = "risk:drawdown_stop_day"
+                    latched_day = get_state(conn, drawdown_latch_key, "")
+
+                    if drawdown_pct >= float(DAILY_DRAWDOWN_STOP_PCT) and latched_day != day_key:
+                        set_state(conn, drawdown_latch_key, day_key)
+                        logger.warning(
+                            f"[RISK_BREAKER] Daily drawdown triggered: drawdown={drawdown_pct:.2f}% "
+                            f"threshold={DAILY_DRAWDOWN_STOP_PCT:.2f}% day_start={day_start_bal}c now={bal_cents}c"
+                        )
+
+                    if get_state(conn, drawdown_latch_key, "") == day_key:
+                        block_new_buys = True
+                        block_reasons.append(f"daily_drawdown_stop day={day_key}")
+
+            if MAX_CONSECUTIVE_LOSSES > 0:
+                pause_key = "risk:loss_streak_pause_until_utc"
+                pause_until_raw = get_state(conn, pause_key, "")
+                pause_until_dt = parse_iso(pause_until_raw) if pause_until_raw else None
+
+                if pause_until_dt and now_dt < pause_until_dt:
+                    block_new_buys = True
+                    mins_left = int((pause_until_dt - now_dt).total_seconds() / 60.0)
+                    block_reasons.append(f"loss_streak_cooldown {max(0, mins_left)}m_left")
+                else:
+                    loss_streak, closed_count = compute_consecutive_closed_losses(
+                        conn,
+                        lookback_hours=CONSECUTIVE_LOSS_LOOKBACK_HOURS,
+                    )
+                    if closed_count >= MAX_CONSECUTIVE_LOSSES and loss_streak >= MAX_CONSECUTIVE_LOSSES:
+                        pause_until = now_dt + timedelta(minutes=max(1, LOSS_STREAK_COOLDOWN_MINUTES))
+                        set_state(conn, pause_key, pause_until.isoformat())
+                        block_new_buys = True
+                        block_reasons.append(
+                            f"loss_streak_trigger losses={loss_streak} lookback={CONSECUTIVE_LOSS_LOOKBACK_HOURS}h"
+                        )
+                        logger.warning(
+                            f"[RISK_BREAKER] Consecutive closed losses={loss_streak} >= {MAX_CONSECUTIVE_LOSSES}. "
+                            f"Blocking BUYs until {pause_until.isoformat()}"
+                        )
+
+            adaptive_edge_penalty = 0.0
+            adaptive_diag = {}
+            try:
+                adaptive_edge_penalty, adaptive_diag = compute_adaptive_edge_penalty_cents(conn)
+            except Exception as e:
+                logger.warning(f"Adaptive edge penalty calculation failed: {repr(e)}")
+                adaptive_edge_penalty, adaptive_diag = 0.0, {}
+
+            if adaptive_edge_penalty > 0:
+                logger.warning(
+                    f"[ADAPTIVE_EDGE] buy_penalty={adaptive_edge_penalty:.2f}c "
+                    f"orders={adaptive_diag.get('total_orders', 0)} fill_rate={adaptive_diag.get('fill_rate', 0.0):.1f}% "
+                    f"slippage={adaptive_diag.get('avg_slippage_per_order', 0.0):.2f}c "
+                    f"(slip_pen={adaptive_diag.get('slippage_penalty', 0.0):.2f} "
+                    f"rej_pen={adaptive_diag.get('reject_penalty', 0.0):.2f})"
+                )
+
+            if block_new_buys:
+                logger.warning(f"[RISK_BREAKER] BUY entries blocked: {'; '.join(block_reasons)}")
+
+            # ---- Entry quality filters (BUY-only) ----
+            series_expectancy = {}
+            if SERIES_EXPECTANCY_FILTER_ENABLED:
+                try:
+                    series_expectancy = compute_series_expectancy_stats(
+                        conn,
+                        lookback_hours=SERIES_EXPECTANCY_LOOKBACK_HOURS,
+                        min_closed_trades=SERIES_EXPECTANCY_MIN_CLOSED_TRADES,
+                    )
+                    if series_expectancy:
+                        worst = sorted(series_expectancy.items(), key=lambda kv: kv[1].get("expectancy", 0.0))[:5]
+                        logger.info(
+                            f"[SERIES_EXPECTANCY] sample={len(series_expectancy)} "
+                            f"worst={[(s, round(m.get('expectancy', 0.0), 4), m.get('count', 0)) for s, m in worst]}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Series expectancy filter error: {repr(e)}")
+                    series_expectancy = {}
+
+            bad_hours = set()
+            if HOURLY_FILTER_ENABLED:
+                try:
+                    hourly = compute_hourly_expectancy(conn, lookback_hours=HOURLY_FILTER_LOOKBACK_HOURS)
+                    for hr, m in hourly.items():
+                        if int(m.get("count", 0)) < HOURLY_FILTER_MIN_CLOSED_TRADES:
+                            continue
+                        if float(m.get("expectancy", 0.0)) < float(HOURLY_FILTER_MIN_EXPECTANCY_DOLLARS):
+                            bad_hours.add(int(hr))
+                    if bad_hours:
+                        logger.warning(f"[HOURLY_FILTER] blocking_buy_hours_utc={sorted(list(bad_hours))}")
+                except Exception as e:
+                    logger.warning(f"Hourly filter error: {repr(e)}")
+                    bad_hours = set()
+
+            ticker_day_trade_counts = {}
+            try:
+                rows = conn.execute(
+                    "SELECT ticker, COUNT(*) FROM trades WHERE DATE(ts_utc)=? GROUP BY ticker",
+                    (day_key,),
+                ).fetchall()
+                for t, cnt in rows:
+                    ticker_day_trade_counts[str(t)] = int(cnt)
+            except Exception as e:
+                logger.warning(f"Ticker day trade count preload error: {repr(e)}")
+                ticker_day_trade_counts = {}
+
             candidates = []
 
             if LIVE_TRADING and (SELL_DIAGNOSTICS or EXIT_SCAN_ALL_POSITIONS):
@@ -2445,7 +2970,7 @@ def main():
                     buy_edge = fair - float(ask)
                     sell_edge = float(bid) - fair
 
-                    eff_buy = buy_edge - (spread / 2.0) - COST_BUFFER_CENTS
+                    eff_buy = buy_edge - (spread / 2.0) - COST_BUFFER_CENTS - adaptive_edge_penalty
                     eff_sell = sell_edge - (spread / 2.0) - COST_BUFFER_CENTS
 
                     checked += 1
@@ -2458,7 +2983,8 @@ def main():
                     elif LOG_CANDIDATE_REJECTION and eff_buy > -2.0:  # Only log near-misses to avoid spam
                         logger.debug(
                             f"REJECT_BUY {ticker} eff_buy={eff_buy:.2f}c < thresh={buy_thresh:.2f}c "
-                            f"(fair={fair:.1f}, ask={ask}, buy_edge={buy_edge:.2f}, min_edge={min_edge_now:.2f})"
+                            f"(fair={fair:.1f}, ask={ask}, buy_edge={buy_edge:.2f}, "
+                            f"min_edge={min_edge_now:.2f}, adaptive_penalty={adaptive_edge_penalty:.2f})"
                         )
 
                     if cur_qty > 0:
@@ -2548,6 +3074,41 @@ def main():
                     continue
                 if direction == "BUY" and placed_live_buy >= MAX_BUY_ORDERS_PER_LOOP:
                     continue
+                if direction == "BUY" and block_new_buys:
+                    if SELL_DIAGNOSTICS:
+                        logger.info(
+                            f"BUY_DIAG {ticker} edge={edge_eff:.2f}c: BLOCKED_BY_RISK_BREAKER "
+                            f"reasons={'|'.join(block_reasons)}"
+                        )
+                    continue
+                if direction == "BUY" and HOURLY_FILTER_ENABLED and now_dt.hour in bad_hours:
+                    if SELL_DIAGNOSTICS:
+                        logger.info(
+                            f"BUY_DIAG {ticker} edge={edge_eff:.2f}c: BLOCKED_BY_HOURLY_FILTER "
+                            f"hour_utc={now_dt.hour}"
+                        )
+                    continue
+                if direction == "BUY" and MAX_TRADES_PER_TICKER_PER_DAY > 0:
+                    tcount = int(ticker_day_trade_counts.get(str(ticker), 0))
+                    if tcount >= MAX_TRADES_PER_TICKER_PER_DAY:
+                        if SELL_DIAGNOSTICS:
+                            logger.info(
+                                f"BUY_DIAG {ticker} edge={edge_eff:.2f}c: TICKER_DAILY_CAP "
+                                f"{tcount}/{MAX_TRADES_PER_TICKER_PER_DAY}"
+                            )
+                        continue
+                if direction == "BUY" and SERIES_EXPECTANCY_FILTER_ENABLED:
+                    sstats = series_expectancy.get(str(series))
+                    if sstats is not None:
+                        exp = float(sstats.get("expectancy", 0.0))
+                        scnt = int(sstats.get("count", 0))
+                        if scnt >= SERIES_EXPECTANCY_MIN_CLOSED_TRADES and exp < SERIES_EXPECTANCY_MIN_EDGE_DOLLARS:
+                            if SELL_DIAGNOSTICS:
+                                logger.info(
+                                    f"BUY_DIAG {ticker} edge={edge_eff:.2f}c: SERIES_EXPECTANCY_FILTER "
+                                    f"series={series} expectancy=${exp:.4f}/trade count={scnt}"
+                                )
+                            continue
                 if LIVE_TRADING and used_today >= MAX_LIVE_ORDERS_PER_DAY:
                     break
 
@@ -2979,6 +3540,21 @@ def main():
                         )
                         exec_qty = live_qty
 
+                    # Persist live fills in trades so downstream analytics/dashboard stay in sync.
+                    record_trade(
+                        conn,
+                        ts,
+                        ticker,
+                        direction,
+                        int(px),
+                        int(exec_qty),
+                        note=(
+                            f"mode=live action={action} status={status or ''} "
+                            f"order_id={order_id or ''} client_order_id={used_client_order_id or ''}"
+                        ).strip(),
+                    )
+                    ticker_day_trade_counts[str(ticker)] = int(ticker_day_trade_counts.get(str(ticker), 0)) + 1
+
                     set_state(conn, f"live_orders_{day_key}", str(used_today + 1))
                     used_today += 1
 
@@ -3037,6 +3613,7 @@ def main():
                         int(live_qty),
                         note=f"mode={'maker' if MAKER_MODE else 'cross'} eff_edge={edge_eff:.1f} fair={fair:.1f}",
                     )
+                    ticker_day_trade_counts[str(ticker)] = int(ticker_day_trade_counts.get(str(ticker), 0)) + 1
                     new_qty = cur_qty + int(live_qty) if direction == "BUY" else cur_qty - int(live_qty)
                     new_avg = float(cur_avg)
                     if direction == "BUY":
