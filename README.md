@@ -225,3 +225,7 @@ For issues or questions:
 **Last Updated**: February 2026  
 **Status**: Active (Trading Live)  
 **Account**: ~$20 with $60 risk limit
+=======
+# Kalshi_Weather_Bot
+kalshi bot sells and buys stock based off statistics
+>>>>>>> 04eec4092ca85ec18cee494e28377c296acb4fb1
