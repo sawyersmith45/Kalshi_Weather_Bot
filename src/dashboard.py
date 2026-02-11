@@ -16,10 +16,22 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 
 load_dotenv()
 
-MAX_RISK = float(os.getenv("MAX_TOTAL_RISK_DOLLARS", "60.0"))
+def get_setting(name, default=None):
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    if value is None:
+        value = os.getenv(name, default)
+    return value
+
+
+MAX_RISK = float(get_setting("MAX_TOTAL_RISK_DOLLARS", "60.0"))
+DATABASE_URL = str(get_setting("DATABASE_URL", "") or "").strip()
 
 
 def parse_ts(value):
@@ -54,7 +66,7 @@ def resolve_db_path():
     root = Path(__file__).resolve().parent.parent
     candidates = []
 
-    env_db = os.getenv("KALSHI_DB_PATH") or os.getenv("DB_PATH")
+    env_db = get_setting("KALSHI_DB_PATH", None) or get_setting("DB_PATH", None)
     if env_db:
         candidates.append(Path(env_db).expanduser())
 
@@ -103,7 +115,7 @@ def resolve_db_path():
     return scored[0]["path"], scored
 
 
-def get_db(path):
+def get_sqlite_db(path):
     db = sqlite3.connect(str(path), check_same_thread=False, timeout=10)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=5000")
@@ -111,9 +123,57 @@ def get_db(path):
     return db
 
 
-def fetch_query(db, sql, params=()):
+@st.cache_resource(show_spinner=False)
+def get_engine(url):
+    return create_engine(url, pool_pre_ping=True)
+
+
+def get_db_handle():
+    if DATABASE_URL:
+        try:
+            engine = get_engine(DATABASE_URL)
+            return {
+                "kind": "engine",
+                "ready": True,
+                "engine": engine,
+                "source": "DATABASE_URL",
+                "path": None,
+                "exists": True,
+                "candidates": [],
+            }
+        except Exception:
+            return {
+                "kind": "engine",
+                "ready": False,
+                "engine": None,
+                "source": "DATABASE_URL",
+                "path": None,
+                "exists": False,
+                "candidates": [],
+            }
+
+    db_path, db_candidates = resolve_db_path()
+    db_exists = db_path.exists()
+    db = get_sqlite_db(db_path) if db_exists else None
+    return {
+        "kind": "sqlite",
+        "ready": db is not None,
+        "conn": db,
+        "source": f"sqlite:{db_path}",
+        "path": db_path,
+        "exists": db_exists,
+        "candidates": db_candidates,
+    }
+
+
+def fetch_query(db_handle, sql, params=()):
     try:
-        return pd.read_sql_query(sql, db, params=params)
+        if db_handle["kind"] == "engine":
+            with db_handle["engine"].connect() as conn:
+                if isinstance(params, dict):
+                    return pd.read_sql_query(text(sql), conn, params=params)
+                return pd.read_sql_query(text(sql), conn)
+        return pd.read_sql_query(sql, db_handle["conn"], params=params)
     except Exception:
         return pd.DataFrame()
 
@@ -152,9 +212,9 @@ def fill_price_from_payload(payload, fallback_price):
     return fallback_price
 
 
-def load_trade_events(db):
+def load_trade_events(db_handle):
     trades_df = fetch_query(
-        db,
+        db_handle,
         """
         SELECT
             ts_utc,
@@ -169,7 +229,7 @@ def load_trade_events(db):
     )
 
     live_df = fetch_query(
-        db,
+        db_handle,
         """
         SELECT
             ts_utc,
@@ -304,22 +364,22 @@ st.title("Kalshi Trading Bot - Live Dashboard")
 if st.button("Refresh Now", key="refresh_btn"):
     st.rerun()
 
-db_path, db_candidates = resolve_db_path()
-db_exists = db_path.exists()
-db = get_db(db_path) if db_exists else None
-trade_events = load_trade_events(db) if db is not None else pd.DataFrame()
+db_handle = get_db_handle()
+trade_events = load_trade_events(db_handle) if db_handle["ready"] else pd.DataFrame()
 
 with st.expander("Debug Info"):
-    st.write(f"**Selected DB Path:** `{db_path}`")
-    st.write(f"**Database Exists:** {db_exists}")
-    if db_candidates:
+    st.write(f"**Data Source:** `{db_handle['source']}`")
+    if db_handle["kind"] == "sqlite":
+        st.write(f"**Selected DB Path:** `{db_handle['path']}`")
+        st.write(f"**Database Exists:** {db_handle['exists']}")
+    if db_handle["kind"] == "sqlite" and db_handle["candidates"]:
         st.write("**DB Freshness (newest first):**")
-        for c in db_candidates:
+        for c in db_handle["candidates"]:
             st.write(
                 f"- `{c['path']}` | latest={c['latest']} | trades={c['latest_trade']} | "
                 f"live_orders={c['latest_live']} | quotes={c['latest_quote']}"
             )
-    if db is not None:
+    if db_handle["ready"]:
         debug_queries = {
             "Total Trades (table)": "SELECT COUNT(*) AS cnt FROM trades",
             "Total Live Orders": "SELECT COUNT(*) AS cnt FROM live_orders",
@@ -332,12 +392,15 @@ with st.expander("Debug Info"):
             "Recent Quotes (1h)": "SELECT COUNT(*) AS cnt FROM quotes WHERE ts_utc > datetime('now', '-1 hour')",
         }
         for label, query in debug_queries.items():
-            result = fetch_query(db, query)
+            result = fetch_query(db_handle, query)
             value = result.iloc[0, 0] if not result.empty else "N/A"
             st.write(f"- {label}: **{value}**")
 
-if db is None:
-    st.error("No database found. Expected one of: env `KALSHI_DB_PATH`, `data/kalshi_quotes.sqlite`, `kalshi.db`.")
+if not db_handle["ready"]:
+    st.error(
+        "No database found. Expected one of: secret/env `DATABASE_URL`, "
+        "`KALSHI_DB_PATH`, `data/kalshi_quotes.sqlite`, `kalshi.db`."
+    )
     st.stop()
 
 col1, col2, col3, col4, col5 = st.columns(5)
@@ -353,7 +416,7 @@ else:
     realized_pnl = float(np.sum(cashflow))
 
 unrealized_df = fetch_query(
-    db,
+    db_handle,
     """
     SELECT
         COALESCE(SUM(
@@ -377,13 +440,13 @@ win_rate, win_samples = compute_win_rate(trade_events)
 with col2:
     st.metric("Win Rate", f"{win_rate:.1f}%", delta=f"{win_samples} closed sells")
 
-pos_df = fetch_query(db, "SELECT COUNT(*) AS cnt FROM positions WHERE qty != 0")
+pos_df = fetch_query(db_handle, "SELECT COUNT(*) AS cnt FROM positions WHERE qty != 0")
 open_pos = int(pos_df["cnt"].iloc[0]) if not pos_df.empty else 0
 with col3:
     st.metric("Open Positions", open_pos)
 
 risk_df = fetch_query(
-    db,
+    db_handle,
     """
     SELECT COALESCE(SUM(
         CASE
@@ -546,7 +609,7 @@ st.divider()
 st.subheader("Forecast Accuracy by Series")
 
 forecast_data = fetch_query(
-    db,
+    db_handle,
     """
     SELECT
         series,
@@ -594,7 +657,7 @@ st.divider()
 st.subheader("Open Positions")
 
 positions = fetch_query(
-    db,
+    db_handle,
     """
     SELECT
         ticker,
@@ -630,7 +693,8 @@ if not positions.empty:
 else:
     st.info("No open positions")
 
-db.close()
+if db_handle["kind"] == "sqlite" and db_handle.get("conn") is not None:
+    db_handle["conn"].close()
 
 st.divider()
 col_time, col_refresh = st.columns([4, 1])
