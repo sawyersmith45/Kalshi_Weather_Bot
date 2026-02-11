@@ -308,7 +308,6 @@ def compute_win_rate(trades):
 
 st.set_page_config(page_title="Kalshi Bot Dashboard", layout="wide")
 st.title("Kalshi Bot Dashboard")
-st.caption("Public performance view. No trading logic is included in this repo.")
 
 if st.button("Refresh Now"):
     st.rerun()
