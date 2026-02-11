@@ -9,6 +9,7 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
@@ -30,8 +31,74 @@ def get_setting(name, default=None):
     return value
 
 
+def get_secret_path(path, default=None):
+    try:
+        node = st.secrets
+    except Exception:
+        return default
+
+    for key in path:
+        try:
+            if isinstance(node, dict):
+                node = node.get(key)
+            else:
+                node = node[key]
+        except Exception:
+            return default
+        if node is None:
+            return default
+    return node
+
+
+def map_get(mapping, key, default=None):
+    if mapping is None:
+        return default
+    try:
+        if isinstance(mapping, dict):
+            return mapping.get(key, default)
+        return mapping[key]
+    except Exception:
+        return default
+
+
+def resolve_database_url():
+    # Common flat keys
+    for key in ("DATABASE_URL", "database_url", "POSTGRES_URL", "SUPABASE_DB_URL"):
+        value = get_setting(key, None)
+        if value:
+            return str(value).strip()
+
+    # Common nested keys in secrets.toml
+    for path in (
+        ("database", "url"),
+        ("postgres", "url"),
+        ("connections", "postgresql", "url"),
+        ("connections", "postgresql", "database_url"),
+    ):
+        value = get_secret_path(path, None)
+        if value:
+            return str(value).strip()
+
+    # Build URL from Streamlit connection-style fields if present
+    conn_cfg = get_secret_path(("connections", "postgresql"), None)
+    if conn_cfg:
+        host = map_get(conn_cfg, "host")
+        user = map_get(conn_cfg, "username") or map_get(conn_cfg, "user")
+        password = map_get(conn_cfg, "password")
+        dbname = map_get(conn_cfg, "database") or map_get(conn_cfg, "dbname") or "postgres"
+        port = map_get(conn_cfg, "port") or 5432
+        sslmode = map_get(conn_cfg, "sslmode") or "require"
+        if host and user and password:
+            return (
+                f"postgresql://{quote_plus(str(user))}:{quote_plus(str(password))}"
+                f"@{host}:{port}/{dbname}?sslmode={sslmode}"
+            )
+
+    return ""
+
+
 MAX_RISK = float(get_setting("MAX_TOTAL_RISK_DOLLARS", "60.0"))
-DATABASE_URL = str(get_setting("DATABASE_URL", "") or "").strip()
+DATABASE_URL = resolve_database_url()
 
 
 def parse_ts(value):
@@ -369,6 +436,7 @@ trade_events = load_trade_events(db_handle) if db_handle["ready"] else pd.DataFr
 
 with st.expander("Debug Info"):
     st.write(f"**Data Source:** `{db_handle['source']}`")
+    st.write(f"**DATABASE_URL Configured:** {'Yes' if bool(DATABASE_URL) else 'No'}")
     if db_handle["kind"] == "sqlite":
         st.write(f"**Selected DB Path:** `{db_handle['path']}`")
         st.write(f"**Database Exists:** {db_handle['exists']}")
@@ -400,6 +468,9 @@ if not db_handle["ready"]:
     st.error(
         "No database found. Expected one of: secret/env `DATABASE_URL`, "
         "`KALSHI_DB_PATH`, `data/kalshi_quotes.sqlite`, `kalshi.db`."
+    )
+    st.info(
+        "For Streamlit Cloud, set secret `DATABASE_URL` in: App Settings -> Secrets, then reboot app."
     )
     st.stop()
 

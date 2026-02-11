@@ -13,6 +13,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
@@ -32,6 +33,68 @@ def secret_or_env(name, default=None):
     return value
 
 
+def secret_path(path, default=None):
+    try:
+        node = st.secrets
+    except Exception:
+        return default
+    for key in path:
+        try:
+            if isinstance(node, dict):
+                node = node.get(key)
+            else:
+                node = node[key]
+        except Exception:
+            return default
+        if node is None:
+            return default
+    return node
+
+
+def map_get(mapping, key, default=None):
+    if mapping is None:
+        return default
+    try:
+        if isinstance(mapping, dict):
+            return mapping.get(key, default)
+        return mapping[key]
+    except Exception:
+        return default
+
+
+def resolve_database_url():
+    for key in ("DATABASE_URL", "database_url", "POSTGRES_URL", "SUPABASE_DB_URL"):
+        value = secret_or_env(key, None)
+        if value:
+            return str(value).strip()
+
+    for path in (
+        ("database", "url"),
+        ("postgres", "url"),
+        ("connections", "postgresql", "url"),
+        ("connections", "postgresql", "database_url"),
+    ):
+        value = secret_path(path, None)
+        if value:
+            return str(value).strip()
+
+    conn_cfg = secret_path(("connections", "postgresql"), None)
+    if conn_cfg:
+        host = map_get(conn_cfg, "host")
+        user = map_get(conn_cfg, "username") or map_get(conn_cfg, "user")
+        password = map_get(conn_cfg, "password")
+        dbname = map_get(conn_cfg, "database") or map_get(conn_cfg, "dbname") or "postgres"
+        port = map_get(conn_cfg, "port") or 5432
+        sslmode = map_get(conn_cfg, "sslmode") or "require"
+        if host and user and password:
+            return (
+                f"postgresql://{quote_plus(str(user))}:{quote_plus(str(password))}"
+                f"@{host}:{port}/{dbname}?sslmode={sslmode}"
+            )
+
+    return None
+
+
 def as_int(value, default=0):
     try:
         return int(value)
@@ -46,7 +109,7 @@ def parse_ts(value):
 
 
 def db_config():
-    db_url = secret_or_env("DATABASE_URL", None)
+    db_url = resolve_database_url()
     sqlite_path = secret_or_env("SQLITE_PATH", "data/kalshi_quotes.sqlite")
     max_risk = float(secret_or_env("MAX_TOTAL_RISK_DOLLARS", "60.0"))
     return db_url, sqlite_path, max_risk
